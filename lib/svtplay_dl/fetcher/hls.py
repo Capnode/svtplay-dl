@@ -88,6 +88,8 @@ def _hlsparse(config, text, url, output, **kwargs):
                     if "CHANNELS" in i:
                         if i["CHANNELS"] == "6":
                             chans = "51"
+                        elif "JOC" in i["CHANNELS"]:
+                            chans = "atmos"
                     if "LANGUAGE" in i:
                         language = i["LANGUAGE"]
                     if "AUTOSELECT" in i and i["AUTOSELECT"].upper() == "YES" and "DEFAULT" in i and i["DEFAULT"].upper() == "YES":
@@ -97,7 +99,7 @@ def _hlsparse(config, text, url, output, **kwargs):
                         if "CHARACTERISTICS" in i:
                             role = f'{role}-{i["CHARACTERISTICS"].replace("se.svt.accessibility.", "")}'
 
-                    media[i["GROUP-ID"]].append([uri, chans, language, role])
+                    media[i["GROUP-ID"]].append([uri, chans, language, role, segments])
 
                 if i["TYPE"] == "SUBTITLES":
                     if "URI" in i:
@@ -110,7 +112,8 @@ def _hlsparse(config, text, url, output, **kwargs):
                             lang = "und"
                         if "CHARACTERISTICS" in i:
                             caption = True
-                        item = [i["URI"], lang, caption]
+                        name = i.get("NAME", None)
+                        item = [i["URI"], lang, caption, name]
                         if item not in subtitles[i["GROUP-ID"]]:
                             subtitles[i["GROUP-ID"]].append(item)
                 continue
@@ -161,7 +164,7 @@ def _hlsparse(config, text, url, output, **kwargs):
                                 role=group[3],
                                 video_role=video_role,
                                 output=loutput,
-                                segments=bool(segments),
+                                segments=bool(group[4]),
                                 channels=chans,
                                 codec=codec,
                                 resolution=resolution,
@@ -187,7 +190,7 @@ def _hlsparse(config, text, url, output, **kwargs):
                             audio=audio_url,
                             video_role=video_role,
                             output=loutput,
-                            segments=bool(segments),
+                            segments=bool(group[4]),
                             channels=chans,
                             codec=codec,
                             resolution=resolution,
@@ -219,7 +222,7 @@ def _hlsparse(config, text, url, output, **kwargs):
                 for n in subtitles[sub]:
                     subfix = n[1]
                     if len(subtitles[sub]) > 1:
-                        if subfix:
+                        if subfix and n[2]:
                             subfix = f"{n[1]}-caption"
                     yield from subtitle_probe(
                         copy.copy(config),
@@ -227,6 +230,7 @@ def _hlsparse(config, text, url, output, **kwargs):
                         output=copy.copy(output),
                         subfix=subfix,
                         cookies=cookies,
+                        name=n[3],
                         **kwargs,
                     )
 
@@ -278,6 +282,26 @@ class HLS(VideoRetriever):
             self.output["ext"] = "audio.ts"
         else:
             self.output["ext"] = "ts"
+
+        # hack to see if we can access the key and abort early if we dont
+        # we can access the m3u8 files but not the actual key.
+        if m3u8.encrypted:
+            for i in m3u8.media_segment:
+                headers = {}
+                if self.keycookie:
+                    keycookies = self.keycookie
+                else:
+                    keycookies = cookies
+                if self.authorization:
+                    headers["authorization"] = self.authorization
+                if "EXT-X-KEY" in i:
+                    keyurl = get_full_url(i["EXT-X-KEY"]["URI"], url)
+                    if keyurl and keyurl[:4] == "skd:":
+                        raise HLSException(keyurl, "Can't decrypt beacuse of DRM")
+                    res = self.http.request("get", keyurl, cookies=keycookies, headers=headers)
+                    if not res.ok:
+                        raise HLSException(keyurl, "Can't access the key to decrypt the files. Reasons could be blocked VPN endpoint")
+
         filename = formatname(self.output, self.config)
         file_d = open(filename, "wb")
 

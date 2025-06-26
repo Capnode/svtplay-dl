@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+from urllib.parse import parse_qs
 from urllib.parse import urlparse
 
 from svtplay_dl.error import ServiceError
@@ -37,6 +38,8 @@ class Tv4play(Service, OpenGraphThumbMixin):
         for key in jansson["props"]["apolloStateFromServer"]["ROOT_QUERY"].keys():
             if key.startswith("media"):
                 key_check = key
+            if key.startswith("short"):
+                key_check = key
         what = jansson["props"]["apolloStateFromServer"]["ROOT_QUERY"][key_check]["__ref"]
 
         if what.startswith("Series:"):
@@ -54,7 +57,7 @@ class Tv4play(Service, OpenGraphThumbMixin):
 
         item = jansson["metadata"]
         if item["isDrmProtected"]:
-            yield ServiceError("We can't download DRM protected content from this site.")
+            yield ServiceError("We can't download DRM protected content from this site. This isn't a svtplay-dl issue.")
             return
 
         if item["isLive"]:
@@ -107,6 +110,7 @@ class Tv4play(Service, OpenGraphThumbMixin):
     def find_all_episodes(self, config):
         episodes = []
         items = []
+        seasonq = None
 
         parse = urlparse(self.url)
         if parse.path.startswith("/klipp"):
@@ -130,6 +134,8 @@ class Tv4play(Service, OpenGraphThumbMixin):
             episodes = self._graphlista(token, show)
             return episodes
 
+        query = parse_qs(parse.query)
+        seasonq = query.get("season", None)
         showid, jansson, kind = self._get_seriesid(self.get_urldata(), dict())
         if showid is None:
             logging.error("Cant find any videos")
@@ -139,12 +145,20 @@ class Tv4play(Service, OpenGraphThumbMixin):
             return episodes
         if kind == "Movie":
             return [f"https://www.tv4play.se/video/{showid}"]
+
         jansson = self._graphdetails(token, showid)
-        for season in jansson["data"]["media"]["allSeasonLinks"]:
-            graph_list = self._graphql(season["seasonId"])
-            for i in graph_list:
-                if i not in items:
-                    items.append(i)
+        graph_list = None
+        for season in reversed(jansson["data"]["media"]["allSeasonLinks"]):
+            if seasonq:
+                if seasonq[0] == season["seasonId"]:
+                    graph_list = self._graphql(token, season["seasonId"])
+            else:
+                graph_list = self._graphql(token, season["seasonId"])
+
+            if graph_list:
+                for i in graph_list:
+                    if i not in items:
+                        items.append(i)
 
         for item in items:
             episodes.append(f"https://www.tv4play.se/video/{item}")
@@ -177,7 +191,7 @@ class Tv4play(Service, OpenGraphThumbMixin):
                 return False, jansson, what[: what.index(":")]
             series = jansson["props"]["apolloStateFromServer"][what]["series"]["__ref"].replace("Series:", "")
             res = self.http.request("get", f"https://www.tv4play.se/program/{series}/")
-            showid, jansson = self._get_seriesid(res.text, jansson)
+            showid, jansson, _ = self._get_seriesid(res.text, jansson)
         return showid, jansson, what[: what.index(":")]
 
     def _graphlista(self, token, show):
@@ -197,8 +211,8 @@ class Tv4play(Service, OpenGraphThumbMixin):
             }
             res = self.http.request(
                 "post",
-                "https://client-gateway.tv4.a2d.tv/graphql",
-                headers={"Client-Name": "tv4-web", "Client-Version": "4.0.0", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+                "https://nordic-gateway.tv4.a2d.tv/graphql",
+                headers={"Client-Name": "tv4-web", "Client-Version": "5.4.0", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
                 json=data,
             )
             janson = res.json()
@@ -218,7 +232,7 @@ class Tv4play(Service, OpenGraphThumbMixin):
 
                 jansson2 = self._graphdetails(token, showid)
                 for season in jansson2["data"]["media"]["allSeasonLinks"]:
-                    graph_list = self._graphql(season["seasonId"])
+                    graph_list = self._graphql(token, season["seasonId"])
                     for i in graph_list:
                         if i not in stuff:
                             stuff.append(i)
@@ -241,13 +255,13 @@ class Tv4play(Service, OpenGraphThumbMixin):
         }
         res = self.http.request(
             "post",
-            "https://client-gateway.tv4.a2d.tv/graphql",
-            headers={"Client-Name": "tv4-web", "Client-Version": "4.0.0", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            "https://nordic-gateway.tv4.a2d.tv/graphql",
+            headers={"Client-Name": "tv4-web", "Client-Version": "5.4.0", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
             json=data,
         )
         return res.json()
 
-    def _graphql(self, show):
+    def _graphql(self, token, show):
         items = []
         nr = 0
         total = 100
@@ -260,8 +274,8 @@ class Tv4play(Service, OpenGraphThumbMixin):
 
             res = self.http.request(
                 "post",
-                "https://client-gateway.tv4.a2d.tv/graphql",
-                headers={"Client-Name": "tv4-web", "Client-Version": "4.0.0", "Content-Type": "application/json"},
+                "https://nordic-gateway.tv4.a2d.tv/graphql",
+                headers={"Client-Name": "tv4-web", "Client-Version": "5.4.0", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
                 json=data,
             )
             janson = res.json()
@@ -291,8 +305,9 @@ class Tv4(Service, OpenGraphThumbMixin):
         self.output["id"] = janson["query"]["id"]
         self.output["title"] = janson["query"]["slug"]
         if janson["query"]["type"] == "Article":
-            vidasset = janson["props"]["pageProps"]["apolloState"][f"Article:{janson['query']['id']}"]["featured"]["__ref"]
-            self.output["id"] = janson["props"]["pageProps"]["apolloState"][vidasset]["id"]
+            videopd = janson["props"]["apolloState"][f"Article:{janson['query']['id']}"]["featuredAsset"]["__ref"]
+            vidasset = janson["props"]["apolloState"][videopd]["asset"]["__ref"]
+            self.output["id"] = janson["props"]["apolloState"][vidasset]["id"]
         url = f"https://playback2.a2d.tv/play/{self.output['id']}?service=tv4&device=browser&protocol=hls%2Cdash&drm=widevine&capabilities=live-drm-adstitch-2%2Cexpired_assets"
         res = self.http.request("get", url, cookies=self.cookies)
         if res.status_code > 200:

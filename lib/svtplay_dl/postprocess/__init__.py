@@ -10,10 +10,13 @@ from shutil import which
 from requests import codes
 from requests import post
 from requests import Timeout
+from svtplay_dl import __version__
 from svtplay_dl.utils.http import FIREFOX_UA
 from svtplay_dl.utils.output import formatname
 from svtplay_dl.utils.proc import run_program
 from svtplay_dl.utils.stream import subtitle_filter
+
+version = __version__.get_versions()["version"]
 
 
 class postprocess:
@@ -59,6 +62,9 @@ class postprocess:
         _, _, stderr = run_program(cmd, False)  # return 1 is good here.
         streams = _streams(stderr)
         videotrack, audiotrack = _checktracks(streams)
+        tracks = [x for x in [videotrack, audiotrack] if x]
+        subs_nr = 0
+        sub_start = 0
 
         if merge_subtitle:
             logging.info("Merge audio, video and subtitle into %s", new_name.name)
@@ -72,6 +78,13 @@ class postprocess:
             arguments += ["-vn"]
         if self.config.get("only_video"):
             arguments += ["-an"]
+
+        if self.config.get("chapters") and self.stream.output["chapters"]:
+            self.chapters(orig_filename)
+            chapter_track = len(tracks)
+            arguments += ["-i", orig_filename.with_suffix(".FFMETADATAFILE"), "-map_metadata", str(chapter_track)]
+            sub_start += 1
+
         arguments += ["-c:v", "copy", "-c:a", "copy", "-f", "matroska" if self.config.get("output_format") == "mkv" else "mp4"]
         if ext == ".ts":
             if audiotrack and "aac" in _getcodec(streams, audiotrack):
@@ -91,9 +104,6 @@ class postprocess:
             arguments += ["-map", f"{audiotrack}"]
         if merge_subtitle:
             langs = _sublanguage(self.stream, self.config, self.subfixes)
-            tracks = [x for x in [videotrack, audiotrack] if x]
-            subs_nr = 0
-            sub_start = 0
             # find what sub track to start with. when a/v is in one file it start with 1
             # if seperate it will start with 2
             for i in tracks:
@@ -142,7 +152,28 @@ class postprocess:
                     os.remove(subfile)
             else:
                 os.remove(subfile)
+        if self.config.get("chapters") and self.stream.output["chapters"]:
+            os.remove(orig_filename.with_suffix(".FFMETADATAFILE"))
         os.rename(tempfile, str(new_name).replace(".audio", ""))
+
+    def chapters(self, filename):
+        chapters = self.stream.output["chapters"]
+        text = ";FFMETADATA1"
+        for i in range(len(chapters) - 1):
+            chap = chapters[i]
+            title = chap["title"]
+            start = chap["startime"]
+            end = chapters[i + 1]["startime"] - 1
+            text += f"""
+[CHAPTER]
+TIMEBASE=1/1000
+START={start}
+END={end}
+title={title}
+"""
+        with open(filename.with_suffix(".FFMETADATAFILE"), "w") as fd:
+            fd.write(text)
+        return True
 
 
 def _streams(output):
@@ -183,14 +214,14 @@ def _sublanguage(stream, config, subfixes):
             fd = open(self, encoding="utf8")
         else:
             fd = open(self)
-        return list(map(parse_block, fd.read().strip().replace("\r", "").split("\n\n")))
+        return list(map(parse_block, fd.read().strip().replace("\r", " ").split("\n\n")))
 
     def query(self):
         _ = parse(self)
-        random_sentences = " ".join(sample(_, len(_) if len(_) < 8 else 8)).replace("\r\n", "")
+        random_sentences = " ".join(sample(_, len(_) if len(_) < 8 else 8)).replace("\r\n", " ")
         url = "https://svtplay-dl.se/langdetect/"
         bits = "64" if sys.maxsize > 2**32 else "32"
-        headers = {"User-Agent": f"{FIREFOX_UA} {platform.machine()} {platform.platform()} {bits}"}
+        headers = {"User-Agent": f"{FIREFOX_UA} {platform.machine()} {platform.platform()} {bits} {version}"}
         try:
             r = post(url, json={"query": random_sentences}, headers=headers, timeout=30)
             if r.status_code == codes.ok:

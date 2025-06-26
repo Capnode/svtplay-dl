@@ -27,6 +27,8 @@ def subtitle_probe(config, url, **kwargs):
         http = HTTP(config)
     subdata = http.request("get", url, cookies=kwargs.get("cookies", None))
 
+    if subdata.content[:3] == b"\xef\xbb\xbf":
+        subdata.encoding = subdata.apparent_encoding
     if subdata.text.startswith("WEBVTT"):
         yield subtitle(config, "wrst", url, **kwargs)
     elif subdata.text.startswith("#EXTM3U"):
@@ -54,6 +56,7 @@ class subtitle:
         self.http = HTTP(config)
         self.subfix = kwargs.get("subfix", None)
         self.bom = False
+        self.name = kwargs.pop("name", None)
         self.output = kwargs.pop("output", None)
         self.kwargs = kwargs
 
@@ -104,7 +107,7 @@ class subtitle:
             data = self.raw(subdata)
 
         if data and len(data) > 0:
-            dupe, fileame = find_dupes(self.output, self.config, False)
+            dupe, fileame = find_dupes(self.output, self.config)
             if dupe and not self.config.get("force_subtitle"):
                 logging.warning("File (%s) already exists. Use --force-subtitle to overwrite", fileame.name)
                 return
@@ -138,12 +141,12 @@ class subtitle:
             tag = norm(node.tag)
             if tag in ("p", "span"):
                 begin = node.attrib["begin"]
-                if not ("dur" in node.attrib):
+                if "dur" not in node.attrib:
                     if "end" not in node.attrib:
                         duration = node.attrib["duration"]
                 else:
                     duration = node.attrib["dur"]
-                if not ("end" in node.attrib):
+                if "end" not in node.attrib:
                     begin2 = begin.split(":")
                     duration2 = duration.split(":")
                     try:
@@ -297,6 +300,8 @@ class subtitle:
         if self.kwargs.get("filter", False):
             self.kwargs["m3u8"] = filter_files(self.kwargs["m3u8"])
 
+        if len(self.kwargs["m3u8"].media_segment) > 100:
+            logging.info("Downloading subtitle. It might take some time.")
         for _, i in enumerate(self.kwargs["m3u8"].media_segment):
             itemurl = get_full_url(i["URI"], self.url)
             cont = self.http.get(itemurl)
@@ -374,14 +379,15 @@ def _wrstsegments(entries: list, convert=False) -> str:
             item = itmes[x].rstrip()
             if not item.rstrip():
                 continue
-            if strdate(item) and len(subs) > 0 and itmes[x + 1] == subs[-1][1]:
-                ha = strdate(subs[-1][0])
-                ha3 = strdate(item)
-                second = str2sec(ha3.group(4)) + time
-                subs[-1][0] = f"{ha.group(1).replace('.', ',')} --> {sec2str(second).replace('.', ',')}"
-                skip = True
-                pre_date_skip = False
-                continue
+            if strdate(item) and len(subs) > 0:
+                if len(subs[-1]) > 1 and len(itmes) > x + 1 and itmes[x + 1] == subs[-1][1]:
+                    ha = strdate(subs[-1][0])
+                    ha3 = strdate(item)
+                    second = str2sec(ha3.group(4)) + time
+                    subs[-1][0] = f"{ha.group(1).replace('.', ',')} --> {sec2str(second).replace('.', ',')}"
+                    skip = True
+                    pre_date_skip = False
+                    continue
             has_date = strdate(item)
             if has_date:
                 if several_items:

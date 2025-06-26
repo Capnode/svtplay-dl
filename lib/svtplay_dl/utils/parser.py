@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import pathlib
 import platform
 
 from yaml import safe_load
@@ -9,9 +10,21 @@ configdata = None
 
 if platform.system() == "Windows":
     APPDATA = os.environ["APPDATA"]
-    CONFIGFILE = os.path.join(APPDATA, "svtplay-dl", "svtplay-dl.yaml")
+    cwd = pathlib.Path(os.getcwd()) / "svtplay-dl.yaml"
+    if os.path.isfile(cwd):
+        CONFIGFILE = cwd
+    else:
+        CONFIGFILE = os.path.join(APPDATA, "svtplay-dl", "svtplay-dl.yaml")
 else:
-    CONFIGFILE = os.path.expanduser("~/.svtplay-dl.yaml")
+    xdg_config_home = os.getenv("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    xdg_config = os.path.join(xdg_config_home, "svtplay-dl", "svtplay-dl.yaml")
+    cwd = pathlib.Path(os.getcwd()) / "svtplay-dl.yaml"
+    if os.path.isfile(cwd):
+        CONFIGFILE = cwd
+    elif os.path.isfile(xdg_config):
+        CONFIGFILE = xdg_config
+    else:
+        CONFIGFILE = os.path.expanduser("~/.svtplay-dl.yaml")
 
 FILENAME = "{title}.s{season}e{episode}.{episodename}-{id}-{service}.{ext}"
 
@@ -163,6 +176,14 @@ def gen_parser(version="unknown"):
         default=False,
         help="only download video if audio and video is seperated",
     )
+    general.add_argument(
+        "--socket-timeout",
+        dest="socket_timeout",
+        metavar="SECONDS",
+        default=20,
+        type=float,
+        help="Time to wait before giving up in seconds",
+    )
 
     quality = parser.add_argument_group("Quality")
     quality.add_argument(
@@ -274,10 +295,6 @@ def gen_parser(version="unknown"):
     alleps.add_argument("--include-clips", dest="include_clips", default=False, action="store_true", help="include clips from websites when using -A")
     alleps.add_argument("-R", "--reverse", action="store_true", dest="reverse_list", default=False, help="Reverse download order")
 
-    cmorep = parser.add_argument_group("C More")
-    cmorep.add_argument("--cmore-operatorlist", dest="cmoreoperatorlist", default=False, action="store_true", help="show operatorlist for cmore")
-    cmorep.add_argument("--cmore-operator", dest="cmoreoperator", default=None, metavar="operator")
-
     postprocessing = parser.add_argument_group("Post-processing")
     postprocessing.add_argument("--no-remux", dest="no_remux", default=False, action="store_true", help="Do not automatically remux to mp4")
     postprocessing.add_argument(
@@ -301,6 +318,13 @@ def gen_parser(version="unknown"):
         default="mp4",
         choices=["mp4", "mkv"],
         help="format you want resulting file in (mkv or mp4), mp4 is default",
+    )
+    postprocessing.add_argument(
+        "--chapters",
+        dest="chapters",
+        default=False,
+        action="store_true",
+        help="Get chapters and add it to the file",
     )
 
     parser.add_argument("urls", nargs="*")
@@ -365,7 +389,6 @@ def setup_defaults():
     options.set("silent_semi", False)
     options.set("proxy", None)
     options.set("include_clips", False)
-    options.set("cmoreoperatorlist", False)
     options.set("filename", FILENAME)
     options.set("only_audio", False)
     options.set("only_video", False)
@@ -373,6 +396,8 @@ def setup_defaults():
     options.set("get_all_subtitles", False)
     options.set("token", None)
     options.set("reverse_list", False)
+    options.set("chapters", False)
+    options.set("socket_timeout", 20)
     return _special_settings(options)
 
 
@@ -423,14 +448,14 @@ def parsertoconfig(config, parser):
     config.set("get_raw_subtitles", parser.get_raw_subtitles)
     config.set("convert_subtitle_colors", parser.convert_subtitle_colors)
     config.set("include_clips", parser.include_clips)
-    config.set("cmoreoperatorlist", parser.cmoreoperatorlist)
-    config.set("cmoreoperator", parser.cmoreoperator)
     config.set("proxy", parser.proxy)
     config.set("only_audio", parser.only_audio)
     config.set("only_video", parser.only_video)
     config.set("output_format", parser.output_format)
     config.set("token", parser.token)
     config.set("reverse_list", parser.reverse_list)
+    config.set("chapters", parser.chapters)
+    config.set("socket_timeout", parser.socket_timeout)
     return _special_settings(config)
 
 

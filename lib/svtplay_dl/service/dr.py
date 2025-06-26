@@ -3,12 +3,12 @@ import json
 import logging
 import re
 import uuid
-from urllib.parse import urlparse
 
 from svtplay_dl.error import ServiceError
 from svtplay_dl.fetcher.hls import hlsparse
 from svtplay_dl.service import OpenGraphThumbMixin
 from svtplay_dl.service import Service
+from svtplay_dl.subtitle import subtitle
 from svtplay_dl.subtitle import subtitle_probe
 
 
@@ -31,6 +31,11 @@ class Dr(Service, OpenGraphThumbMixin):
             else:
                 yield from hlsparse(self.config, res, match.group(1), output=self.output)
             return
+        apimatch = re.search("CLIENT_SERVICE_URL='([^']+)", data)
+        if not apimatch:
+            yield ServiceError("Can't find api server.")
+            return
+        apiserver = apimatch.group(1)
         janson = json.loads(match.group(1))
         page = janson["cache"]["page"][list(janson["cache"]["page"].keys())[0]]
         resolution = None
@@ -55,7 +60,7 @@ class Dr(Service, OpenGraphThumbMixin):
 
         offerlist = []
         for i in offers:
-            if i["deliveryType"] == "Stream":
+            if i["deliveryType"] == "StreamOrDownload":
                 offerlist.append([i["scopes"][0], i["resolution"]])
 
         deviceid = uuid.uuid1()
@@ -70,22 +75,48 @@ class Dr(Service, OpenGraphThumbMixin):
             yield ServiceError("Can't find any videos")
             return
 
+        entries = []
         for i in offerlist:
             vid, resolution = i
             url = (
-                f"https://isl.dr-massive.com/api/account/items/{vid}/videos?delivery=stream&device=web_browser&"
+                f"{apiserver}/account/items/{vid}/videos?delivery=stream&device=web_browser&"
                 f"ff=idp%2Cldp&lang=da&resolution={resolution}&sub=Anonymous"
             )
-            res = self.http.request("get", url, headers={"authorization": f"Bearer {token}"})
+            res = self.http.request("get", url, headers={"x-authorization": f"Bearer {token}"})
+            if res.status_code > 400:
+                yield ServiceError("Can't find the video or its geoblocked")
+                return
             for video in res.json():
                 if video["accessService"] == "StandardVideo" and video["format"] == "video/hls":
                     res = self.http.request("get", video["url"])
                     if res.status_code > 400:
                         yield ServiceError("Can't play this because the video is geoblocked or not available.")
                     else:
-                        yield from hlsparse(self.config, res, video["url"], output=self.output)
+                        hls = hlsparse(self.config, res, video["url"], output=self.output)
+                        entries.append(hls)
                         if len(video["subtitles"]) > 0:
-                            yield from subtitle_probe(copy.copy(self.config), video["subtitles"][0]["link"], output=self.output)
+                            for i in video["subtitles"]:
+                                sub = subtitle_probe(copy.copy(self.config), i["link"], name=i["language"], output=self.output)
+                                entries.append(sub)
+            subs = []
+            for entry in entries:
+                for i in entry:
+                    if isinstance(i, subtitle):
+                        subs.append(i)
+                    else:
+                        yield i
+
+            if subs:
+                if any("Dansk" == y.name for y in subs):
+                    for i in subs:
+                        if i.name == "Dansk":
+                            yield i
+                elif any("CombinedLanguageSubtitles" == y.name for y in subs):
+                    for i in subs:
+                        if i.name == "CombinedLanguageSubtitles":
+                            yield i
+                else:
+                    yield from subs
 
     def find_all_episodes(self, config):
         episodes = []
@@ -93,26 +124,25 @@ class Dr(Service, OpenGraphThumbMixin):
         data = self.get_urldata()
         match = re.search("__data = ([^<]+)</script>", data)
         if not match:
-            if "bonanza" in self.url:
-                parse = urlparse(self.url)
-                match = re.search(r"(\/bonanza\/serie\/[0-9]+\/[\-\w]+)", parse.path)
-                if match:
-                    match = re.findall(rf"a href=\"({match.group(1)}\/\d+[^\"]+)\"", data)
-                    if not match:
-                        logging.error("Can't find video info.")
-                    for url in match:
-                        episodes.append(f"https://www.dr.dk{url}")
-                else:
-                    logging.error("Can't find video info.")
-                return episodes
-            else:
-                logging.error("Can't find video info.")
-                return episodes
+            logging.error("Can't find video info.")
+            return episodes
+
         janson = json.loads(match.group(1))
+
+        if "/saeson/" in self.url:
+            page = janson["cache"]["page"][list(janson["cache"]["page"].keys())[0]]
+            for i in page["item"]["show"]["seasons"]["items"]:
+                seasons.append(f'https://www.dr.dk/drtv{i["path"]}')
+
         page = janson["cache"]["page"][list(janson["cache"]["page"].keys())[0]]
 
-        if "show" in page["item"] and "seasons" in page["item"]["show"]:
-            for i in page["item"]["show"]["seasons"]["items"]:
+        if (
+            "item" in page["entries"][0]
+            and "season" in page["entries"][0]["item"]
+            and "show" in page["entries"][0]["item"]["season"]
+            and "seasons" in page["entries"][0]["item"]["season"]["show"]
+        ):
+            for i in page["entries"][0]["item"]["season"]["show"]["seasons"]["items"]:
                 seasons.append(f'https://www.dr.dk/drtv{i["path"]}')
 
         if seasons:

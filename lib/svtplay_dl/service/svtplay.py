@@ -17,6 +17,7 @@ from svtplay_dl.fetcher.dash import dashparse
 from svtplay_dl.fetcher.hls import hlsparse
 from svtplay_dl.service import MetadataThumbMixin
 from svtplay_dl.service import Service
+from svtplay_dl.subtitle import subtitle
 from svtplay_dl.subtitle import subtitle_probe
 from svtplay_dl.utils.text import filenamify
 
@@ -75,9 +76,9 @@ class Svtplay(Service, MetadataThumbMixin):
             if "data" in data_entry:
                 entry = json.loads(data_entry["data"])
                 for key, data in entry.items():
-                    if key == "detailsPageByPath" and data and "moreDetails" in data:
+                    if key == "detailsPageByPath" and data and "smartStart" in data and data["smartStart"]:
                         video_data = data
-                        vid = data["video"]["svtId"]
+                        vid = data["smartStart"]["videoSvtId"]
                         break
 
         if not vid:
@@ -86,6 +87,7 @@ class Svtplay(Service, MetadataThumbMixin):
 
         self.outputfilename(video_data)
         self.extrametadata(video_data)
+        self.chaptersdata(video_data)
 
         res = self.http.get(URL_VIDEO_API + vid)
         try:
@@ -100,6 +102,9 @@ class Svtplay(Service, MetadataThumbMixin):
         yield from videos
 
     def _get_video(self, janson):
+        entries = []
+        subs = []
+
         if "subtitleReferences" in janson:
             for i in janson["subtitleReferences"]:
                 if "url" in i:
@@ -112,40 +117,51 @@ class Svtplay(Service, MetadataThumbMixin):
                             subfix = f"{lang}-caption"
                         else:
                             subfix = lang
-                    yield from subtitle_probe(copy.copy(self.config), i["url"], subfix=subfix, output=self.output)
+                    for x in subtitle_probe(copy.copy(self.config), i["url"], subfix=subfix, output=self.output):
+                        subs.append(x)
+
+        if not janson["videoReferences"]:
+            yield ServiceError("Media doesn't have any associated videos.")
+            return
 
         drm = janson["rights"]["drmCopyProtection"]
         if not drm and "variants" in janson and "default" in janson["variants"]:
-            if len(janson["variants"]["default"]["videoReferences"]) == 0:
+            if len(janson["videoReferences"]) == 0:
                 yield ServiceError("Media doesn't have any associated videos.")
                 return
 
-            for videorfc in janson["variants"]["default"]["videoReferences"]:
+            for videorfc in janson["videoReferences"]:
                 params = {}
                 special = False
-                params["manifestUrl"] = quote_plus(videorfc["url"])
-
+                video_resolv_url = self.http.get(videorfc["resolve"]).json()["location"]
+                params["manifestUrl"] = quote_plus(video_resolv_url)
                 format = videorfc["format"]
                 if "audioDescribed" in janson["variants"] and janson["variants"]["audioDescribed"]:
                     for audiodesc in janson["variants"]["audioDescribed"]["videoReferences"]:
                         if audiodesc["format"] == format:
                             special = True
-                            params["manifestUrlAudioDescription"] = audiodesc["url"]
+                            audio_resolv_url = self.http.get(audiodesc["resolve"]).json()["location"]
+                            params["manifestUrlAudioDescription"] = audio_resolv_url
                 if "signInterpreted" in janson["variants"] and janson["variants"]["signInterpreted"]:
                     for signinter in janson["variants"]["signInterpreted"]["videoReferences"]:
                         if signinter["format"] == format:
                             special = True
-                            params["manifestUrlSignLanguage"] = signinter["url"]
+                            audio_resolv_url = self.http.get(signinter["resolve"]).json()["location"]
+                            params["manifestUrlSignLanguage"] = audio_resolv_url
                 if special:
                     params = _dict_to_flatstr(params)
                     pl_url = f"https://api.svt.se/ditto/api/v1/web?{params}"
                 else:
                     pl_url = videorfc["url"]
 
+                if "hls-ts-full" == format:
+                    continue
                 if pl_url.find(".m3u8") > 0:
-                    yield from hlsparse(self.config, self.http.request("get", pl_url), pl_url, output=self.output)
+                    hls = hlsparse(self.config, self.http.request("get", pl_url), pl_url, output=self.output)
+                    entries.append(hls)
                 elif pl_url.find(".mpd") > 0:
-                    yield from dashparse(self.config, self.http.request("get", pl_url), pl_url, output=self.output)
+                    mpd = dashparse(self.config, self.http.request("get", pl_url), pl_url, output=self.output)
+                    entries.append(mpd)
 
         else:
             if "videoReferences" in janson:
@@ -154,8 +170,28 @@ class Svtplay(Service, MetadataThumbMixin):
                     return
 
                 for i in janson["videoReferences"]:
+                    if "hls-ts-full" == i["format"]:
+                        continue
                     if i["url"].find(".m3u8") > 0:
-                        yield from hlsparse(self.config, self.http.request("get", i["url"]), i["url"], output=self.output)
+                        rdr_resp_url = self.http.get(i["resolve"]).json()["location"]
+                        hls = hlsparse(self.config, self.http.request("get", rdr_resp_url), rdr_resp_url, output=self.output)
+                        entries.append(hls)
+
+        for entry in entries:
+            for i in entry:
+                if isinstance(i, subtitle):
+                    subs.append(i)
+                else:
+                    yield i
+
+        if check_exists(["sv", "sv-caption"], subs):
+            for i in subs:
+                if i.subfix == "sv-caption":
+                    i.subfix = "sv"
+                    yield i
+        else:
+            for i in subs:
+                yield i
 
     def _lists(self):
         videos = []
@@ -217,14 +253,16 @@ class Svtplay(Service, MetadataThumbMixin):
                         video_data = data["lazyLoadedTabs"]
         if not video_data:
             return episodes
+
         for lazytab in video_data:
-            if "selections" in lazytab:
-                for section in lazytab["selections"]:
-                    for i in section["items"]:
-                        if i["item"]["__typename"] == "Single":
-                            singles.append(urljoin("http://www.svtplay.se", i["item"]["urls"]["svtplay"]))
-                        else:
-                            videos.append(urljoin("http://www.svtplay.se", i["item"]["urls"]["svtplay"]))
+            if lazytab["slug"] == "all":
+                for module in lazytab["modules"]:
+                    if "selection" in module:
+                        for i in module["selection"]["items"]:
+                            if i["item"]["__typename"] == "Single":
+                                singles.append(urljoin("http://www.svtplay.se", i["item"]["urls"]["svtplay"]))
+                            else:
+                                videos.append(urljoin("http://www.svtplay.se", i["item"]["urls"]["svtplay"]))
         for i in videos:
             episodes.extend(self._all_episodes(i))
         if singles:
@@ -251,9 +289,8 @@ class Svtplay(Service, MetadataThumbMixin):
         for data_entry in janson["props"]["urqlState"].values():
             if "data" in data_entry:
                 entry = json.loads(data_entry["data"])
-                # logging.info(json.dumps(entry))
                 for key, data in entry.items():
-                    if key == "detailsPageByPath" and data and "heading" in data:
+                    if key == "detailsPageByPath" and data and "smartStart" in data:
                         video_data = data
                         break
 
@@ -262,12 +299,13 @@ class Svtplay(Service, MetadataThumbMixin):
             return videos
         if video_data["item"]["parent"]["__typename"] == "Single":
             videos.append(urljoin("http://www.svtplay.se", video_data["item"]["urls"]["svtplay"]))
-        for i in video_data["associatedContent"]:
+
+        for i in video_data["modules"]:
             if tab:
                 if tab == i["id"]:
                     collections.append(i)
             else:
-                if i["id"] == "upcoming" or i["id"] == "related":
+                if i["id"] == "upcoming" or i["id"] == "related" or i["id"].startswith("details"):
                     continue
                 elif self.config.get("include_clips") and "clips" in i["id"]:
                     collections.append(i)
@@ -275,7 +313,9 @@ class Svtplay(Service, MetadataThumbMixin):
                     collections.append(i)
 
         for i in collections:
-            for epi in i["items"]:
+            if not i["selection"]:
+                continue
+            for epi in i["selection"]["items"]:
                 if epi["item"]["urls"]["svtplay"] not in videos:
                     videos.append(urljoin("http://www.svtplay.se", epi["item"]["urls"]["svtplay"]))
         return videos
@@ -306,10 +346,16 @@ class Svtplay(Service, MetadataThumbMixin):
     def outputfilename(self, data):
         name = None
         desc = None
+        modulej = None
 
-        name = data["moreDetails"]["heading"]
-        other = data["moreDetails"]["episodeHeading"]
-        vid = hashlib.sha256(data["video"]["svtId"].encode("utf-8")).hexdigest()[:7]
+        for module in data["modules"]:
+            if "analytics" in module and module["analytics"]["json"]["moduleType"] == "Details":
+                modulej = module
+        if modulej is None:
+            return
+        name = modulej["details"]["heading"]
+        other = modulej["details"]["smartStart"]["item"]["videos"][0]["name"]
+        vid = hashlib.sha256(modulej["details"]["smartStart"]["videoSvtId"].encode("utf-8")).hexdigest()[:7]
 
         if name == other:
             other = None
@@ -317,8 +363,7 @@ class Svtplay(Service, MetadataThumbMixin):
             name = other
             other = None
         elif other is None:
-            if name != data["moreDetails"]["titleHeading"]:
-                other = data["moreDetails"]["titleHeading"]
+            pass
 
         season, episode = self.seasoninfo(data)
         if "accessibility" in data:
@@ -353,6 +398,12 @@ class Svtplay(Service, MetadataThumbMixin):
         return season, episode
 
     def _find_season(self, data):
+        modulej = None
+        for module in data["modules"]:
+            if "analytics" in module and module["analytics"]["json"]["moduleType"] == "Details":
+                modulej = module
+        if modulej is None:
+            return
         match = re.search(r"/säsong (\d+)/", data["analytics"]["json"]["viewId"])
         if match:
             return match.group(1)
@@ -361,20 +412,19 @@ class Svtplay(Service, MetadataThumbMixin):
         if match:
             return match.group(1)
 
-        vid = data["video"]["svtId"]
-        for seasons in data["associatedContent"]:
-            for i in seasons["items"]:
-                if i["item"]["videoSvtId"] == vid and "positionInSeason" in i["item"]:
-                    match = re.search(r"S.song (\d+)", i["item"]["positionInSeason"])
-                    if match:
-                        return match.group(1)
-
-        if "productionYearRange" in data["moreDetails"]:
-            return data["moreDetails"]["productionYearRange"]
+        if "productionYear" in data["moreDetails"]:
+            return data["moreDetails"]["productionYear"]
 
         return None
 
     def _find_episode(self, data):
+        modulej = None
+        for module in data["modules"]:
+            if "analytics" in module and module["analytics"]["json"]["moduleType"] == "Details":
+                modulej = module
+        if modulej is None:
+            return
+
         match = re.search(r"/avsnitt (\d+)", data["analytics"]["json"]["viewId"])
         if match:
             return match.group(1)
@@ -382,17 +432,6 @@ class Svtplay(Service, MetadataThumbMixin):
         match = re.search(r"Avsnitt (\d+)", data["item"]["name"])
         if match:
             return match.group(1)
-
-        vid = data["video"]["svtId"]
-        for seasons in data["associatedContent"]:
-            for i in seasons["items"]:
-                if i["item"]["videoSvtId"] == vid:
-                    if "positionInSeason" in i["item"]:
-                        match = re.search(r"Avsnitt (\d+)", i["item"]["positionInSeason"])
-                        if match:
-                            return match.group(1)
-                    if "number" in i["item"]:
-                        return i["item"]["number"]
 
         if "description" in data:
             match = re.search(r"Del (\d+) av (\d+)", data["description"])
@@ -402,6 +441,12 @@ class Svtplay(Service, MetadataThumbMixin):
         return None
 
     def extrametadata(self, episode):
+        modulej = None
+        for module in episode["modules"]:
+            if "analytics" in module and module["analytics"]["json"]["moduleType"] == "Details":
+                modulej = module
+        if modulej is None:
+            return
         self.output["tvshow"] = self.output["season"] is not None and self.output["episode"] is not None
         if "validFrom" in episode["item"]:
 
@@ -429,7 +474,7 @@ class Svtplay(Service, MetadataThumbMixin):
                 )
             self.output["publishing_datetime"] = int(date)
 
-        self.output["title_nice"] = episode["moreDetails"]["heading"]
+        self.output["title_nice"] = modulej["details"]["heading"]
 
         try:
             t = episode["item"]["parent"]["image"]["wide"]
@@ -460,9 +505,20 @@ class Svtplay(Service, MetadataThumbMixin):
         if "description" in episode:
             self.output["episodedescription"] = episode["description"]
 
+    def chaptersdata(self, video_data):
+        chapters = []
+        for chapter in video_data["highlights"]:
+            chap = {"title": chapter["name"], "startime": chapter["positionInSeconds"] * 1000}
+            chapters.append(chap)
+        self.output["chapters"] = chapters
+
 
 def _dict_to_flatstr(flat):
     text = ""
     for i in flat:
         text += f"{i}={flat[i]}&"
     return text
+
+
+def check_exists(valuea, valueb):
+    return all(any(x == y.subfix for y in valueb) for x in valuea)

@@ -152,19 +152,19 @@ def formatname(output, config):
             tvshow = output.get("tvshow", False)
         if config.get("subfolder") and "title" in output and tvshow:
             # Add subfolder with name title
-            subfolder = pathlib.Path(output["title"])
+            subfolder = sanitize(pathlib.Path(output["title"]))
         elif config.get("subfolder") and not tvshow:
             # Add subfolder with name movies
             subfolder = pathlib.Path("movies")
     if config.get("output") and pathlib.Path(config.get("output")).expanduser().is_dir():
         dirname = pathlib.Path(config.get("output"))
     elif config.get("path") and pathlib.Path(config.get("path")).expanduser().is_dir():
-        dirname = pathlib.Path(config.get("path"))
+        dirname = pathlib.Path(config.get("path")).expanduser()
     elif config.get("output"):
         if "ext" in output and output["ext"]:
-            name = pathlib.Path(f"{config.get('output')}.{output['ext']}")
+            name = pathlib.Path(f"{config.get('output')}.{output['ext']}").expanduser()
         else:
-            name = pathlib.Path(config.get("output"))
+            name = pathlib.Path(config.get("output")).expanduser()
     name = pathlib.Path(sanitize(name.expanduser()))
     if subfolder and dirname:
         return dirname / subfolder / name.expanduser()
@@ -194,7 +194,10 @@ def _formatname(output, config):
         if key == "service" and output[key]:
             name = name.replace("{service}", output[key])
         if key == "ext" and output[key]:
-            name = name.replace("{ext}", output[key])
+            if "{ext}" in name:
+                name = name.replace("{ext}", output[key])
+            else:
+                name = f"{name}.{output[key]}"
 
     # Remove all {text} we cant replace with something
     for item in re.findall(r"([\.\-]?(([^\.\-]+\w+)?\{[\w\-]+\}))", name):
